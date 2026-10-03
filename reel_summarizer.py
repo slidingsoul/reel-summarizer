@@ -6,19 +6,47 @@ Fetches transcripts, summarizes with AI, and saves to Notion.
 
 import sys
 import re
+import time
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
 import os
 from notion_client import Client
 
+try:
+    from supadata import Supadata, SupadataError
+except ImportError:  # pragma: no cover - surfaced clearly at runtime
+    Supadata = None
+    SupadataError = Exception
+
 # Load environment variables
 load_dotenv()
 
 SOCIALKIT_API_KEY = os.getenv('SOCIALKIT_API_KEY')
+SUPADATA_API_KEY = os.getenv('SUPADATA_API_KEY')
+# Canonical LLM settings (provider-agnostic, OpenAI-compatible chat completions).
+# OPENROUTER_* are still honored as legacy fallbacks.
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 NOTION_TOKEN = os.getenv('NOTION_TOKEN')
 NOTION_FOLDER_PAGE_ID = os.getenv('NOTION_FOLDER_PAGE_ID')
+
+DEFAULT_LLM_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+DEFAULT_LLM_MODEL = 'mistralai/mistral-7b-instruct'
+
+
+def get_llm_api_url():
+    """Resolve the chat-completions endpoint URL (any OpenAI-compatible provider)."""
+    return (os.getenv('LLM_API_URL') or DEFAULT_LLM_API_URL).strip() or DEFAULT_LLM_API_URL
+
+
+def get_llm_api_key():
+    """Resolve the LLM API key (LLM_API_KEY preferred, OPENROUTER_API_KEY legacy)."""
+    return os.getenv('LLM_API_KEY') or os.getenv('OPENROUTER_API_KEY')
+
+
+def get_llm_model():
+    """Resolve the LLM model name (LLM_MODEL preferred, OPENROUTER_MODEL legacy)."""
+    return os.getenv('LLM_MODEL') or os.getenv('OPENROUTER_MODEL') or DEFAULT_LLM_MODEL
 
 def validate_env():
     """Validate that all required environment variables are set."""
@@ -26,8 +54,10 @@ def validate_env():
 
     if not SOCIALKIT_API_KEY:
         missing.append('SOCIALKIT_API_KEY')
-    if not OPENROUTER_API_KEY:
-        missing.append('OPENROUTER_API_KEY')
+    if not SUPADATA_API_KEY:
+        missing.append('SUPADATA_API_KEY (required for transcription fallback)')
+    if not get_llm_api_key():
+        missing.append('LLM_API_KEY (or legacy OPENROUTER_API_KEY)')
     if not NOTION_TOKEN:
         missing.append('NOTION_TOKEN')
     if not NOTION_FOLDER_PAGE_ID:
@@ -153,8 +183,27 @@ def format_rich_text(text: str) -> list[dict]:
     return rich_text
 
 
-def fetch_transcript(reel_url):
-    """Fetch transcript from SocialKit API."""
+def is_socialkit_quota_error(status_code, message):
+    """Return True only when a SocialKit failure looks like quota/credit exhaustion.
+
+    Fallback to Supadata must NOT trigger on private reels, missing audio,
+    invalid URLs, etc. — only on quota-like signals.
+    """
+    if status_code in (402, 403, 429):
+        return True
+    if not message:
+        return False
+    lowered = str(message).lower()
+    quota_markers = (
+        'quota', 'credit', 'limit exceeded', 'rate limit', 'too many requests',
+        'exhausted', 'insufficient', 'out of credits', 'no credits',
+        'payment', 'billing', 'plan', 'upgrade', '402', '429',
+    )
+    return any(marker in lowered for marker in quota_markers)
+
+
+def fetch_transcript_socialkit(reel_url):
+    """Fetch transcript from SocialKit API (primary provider)."""
     print('📹 Fetching transcript from SocialKit...')
 
     url = 'https://api.socialkit.dev/instagram/transcript'
@@ -173,7 +222,7 @@ def fetch_transcript(reel_url):
             raise Exception(f"SocialKit error: {data.get('message', 'Unknown error')}")
 
         transcript = data['data']['transcript']
-        print('✅ Transcript fetched successfully')
+        print('✅ Transcript fetched successfully [SocialKit]')
         print(f'   Length: {len(transcript)} characters\n')
 
         return transcript
@@ -181,12 +230,117 @@ def fetch_transcript(reel_url):
     except requests.exceptions.Timeout:
         raise Exception('SocialKit API timeout - reel might not have audio or transcript available')
     except requests.exceptions.RequestException as e:
-        raise Exception(f'SocialKit API error: {e}')
+        status_code = e.response.status_code if getattr(e, 'response', None) is not None else None
+        suffix = f' [HTTP {status_code}]' if status_code else ''
+        raise Exception(f'SocialKit API error{suffix}: {e}') from e
+
+
+def _supadata_content_to_text(content):
+    """Normalize Supadata transcript content (str or chunk list) to plain text."""
+    if content is None:
+        return ''
+    if isinstance(content, str):
+        return content.strip()
+    # List of chunks: each may be a dict or TranscriptChunk dataclass
+    parts = []
+    for chunk in content:
+        if isinstance(chunk, dict):
+            text = chunk.get('text', '')
+        else:
+            text = getattr(chunk, 'text', '')
+        if text:
+            parts.append(str(text).strip())
+    return ' '.join(parts).strip()
+
+
+def _poll_supadata_job(job_id, timeout_s=120, interval_s=2):
+    """Poll Supadata transcript job until completed/failed (handles HTTP 202)."""
+    url = f'https://api.supadata.ai/v1/transcript/{job_id}'
+    headers = {'x-api-key': SUPADATA_API_KEY}
+    deadline = time.time() + timeout_s
+
+    while True:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get('status')
+
+        if status == 'completed':
+            return _supadata_content_to_text(data.get('content'))
+        if status == 'failed':
+            raise Exception(f"Supadata job failed: {data.get('error', data)}")
+        if time.time() >= deadline:
+            raise Exception(f'Supadata job {job_id} timed out after {timeout_s}s (last status: {status})')
+        time.sleep(interval_s)
+
+
+def fetch_transcript_supadata(reel_url):
+    """Fetch transcript from Supadata API via official SDK (fallback provider)."""
+    if Supadata is None:
+        raise Exception('Supadata SDK not installed. Run: uv sync')
+    if not SUPADATA_API_KEY:
+        raise Exception('Missing SUPADATA_API_KEY - cannot use Supadata fallback')
+
+    print('📹 Fetching transcript from Supadata (fallback)...')
+
+    try:
+        client = Supadata(api_key=SUPADATA_API_KEY)
+        result = client.transcript(url=reel_url, text=True, mode='auto')
+
+        # Async path: SDK returns BatchJob(job_id=...) for HTTP 202
+        job_id = getattr(result, 'job_id', None)
+        if job_id:
+            print(f'   Supadata job queued ({job_id}), polling for result...')
+            transcript = _poll_supadata_job(job_id)
+        else:
+            transcript = _supadata_content_to_text(getattr(result, 'content', ''))
+
+        if not transcript:
+            raise Exception('Supadata returned an empty transcript (no speech detected?)')
+
+        print('✅ Transcript fetched successfully [Supadata]')
+        print(f'   Length: {len(transcript)} characters\n')
+        return transcript
+
+    except Exception as e:
+        # Preserve structured SupadataError details when available
+        if SupadataError is not Exception and isinstance(e, SupadataError):
+            raise Exception(f'Supadata error [{e.error}]: {e.message} - {e.details}') from e
+        if isinstance(e, requests.exceptions.RequestException):
+            raise Exception(f'Supadata API error: {e}') from e
+        raise
+
+
+def fetch_transcript(reel_url):
+    """Fetch transcript, falling back to Supadata only on SocialKit quota errors."""
+    try:
+        return fetch_transcript_socialkit(reel_url)
+    except Exception as socialkit_error:
+        message = str(socialkit_error)
+        # Best-effort status extraction for quota detection
+        status_code = None
+        match = re.search(r'\b(402|403|429)\b', message)
+        if match:
+            status_code = int(match.group(1))
+
+        if not is_socialkit_quota_error(status_code, message):
+            raise
+
+        print(f'⚠️ SocialKit quota/credit issue detected: {message}')
+        print('   Falling back to Supadata...\n')
+        try:
+            return fetch_transcript_supadata(reel_url)
+        except Exception as supadata_error:
+            raise Exception(
+                f'SocialKit quota exhausted and Supadata fallback failed. '
+                f'SocialKit: {socialkit_error} | Supadata: {supadata_error}'
+            ) from supadata_error
 
 
 def summarize_text(transcript):
-    """Summarize transcript using OpenRouter API."""
-    print('🤖 Sending to OpenRouter for summarization...')
+    """Summarize transcript using any OpenAI-compatible chat completions API."""
+    model = get_llm_model()
+    print(f'🤖 Sending to LLM for summarization (model: {model})...')
 
     prompt = f"""Summarize the following Instagram reel transcript using Markdown format.
 
@@ -197,15 +351,20 @@ Then use:
 
 {transcript}"""
 
-    url = 'https://openrouter.ai/api/v1/chat/completions'
-    headers = {
-        'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-        'HTTP-Referer': 'https://github.com',
-        'X-Title': 'Reel Summarizer CLI',
-    }
+    url = get_llm_api_url()
+    api_key = get_llm_api_key()
+    if not api_key:
+        raise Exception('Missing LLM API key (set LLM_API_KEY or legacy OPENROUTER_API_KEY)')
 
-    # Use model from environment variable or fallback to free model
-    model = os.getenv('OPENROUTER_MODEL', 'mistralai/mistral-7b-instruct')
+    headers = {
+        'Authorization': f'Bearer {api_key}',
+    }
+    # OpenRouter-specific headers: only send them to OpenRouter
+    if 'openrouter.ai' in url:
+        headers.update({
+            'HTTP-Referer': 'https://github.com',
+            'X-Title': 'Reel Summarizer CLI',
+        })
 
     payload = {
         'model': model,
@@ -224,7 +383,7 @@ Then use:
         data = response.json()
 
         if 'error' in data:
-            raise Exception(f"OpenRouter error: {data['error'].get('message', 'Unknown error')}")
+            raise Exception(f"LLM error: {data['error'].get('message', 'Unknown error')}")
 
         summary = data['choices'][0]['message']['content']
         print('✅ Summarization complete\n')
@@ -232,7 +391,7 @@ Then use:
         return summary
 
     except requests.exceptions.RequestException as e:
-        raise Exception(f'OpenRouter API error: {e}')
+        raise Exception(f'LLM API error: {e}')
 
 
 def save_to_notion(summary):
@@ -280,40 +439,81 @@ def save_to_notion(summary):
         raise Exception(f'Notion API error: {str(e)}')
 
 
+def process_reel(reel_url):
+    """Process a single reel URL: fetch transcript, summarize, save to Notion."""
+    # Validate URL
+    validate_url(reel_url)
+
+    print('🚀 Starting reel summarizer\n')
+
+    # Fetch transcript
+    transcript = fetch_transcript(reel_url)
+
+    # Summarize
+    summary = summarize_text(transcript)
+
+    # Save to Notion
+    save_to_notion(summary)
+
+    print('🎉 All done!')
+
+
+def read_urls_from_file(file_path):
+    """Read reel URLs from a file (one per line, `#` comments and blanks ignored)."""
+    urls = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#'):
+                continue
+            urls.append(stripped)
+    return urls
+
+
 def main():
     """Main function."""
     # Validate environment
     validate_env()
 
-    # Get reel URL from command line
+    # Get reel URL or batch file from command line
     if len(sys.argv) < 2:
-        print('Usage: python reel_summarizer.py <instagram-reel-url>')
-        print('\nExample: python reel_summarizer.py https://www.instagram.com/reel/ABC123/')
+        print('Usage: reel-summarizer <instagram-reel-url | batch-file>')
+        print('\nExamples:')
+        print('  reel-summarizer https://www.instagram.com/reel/ABC123/')
+        print('  reel-summarizer reels.txt')
         sys.exit(1)
 
-    reel_url = sys.argv[1]
+    arg = sys.argv[1]
 
-    # Validate URL
+    # Batch mode: argument is a file with one URL per line
+    if os.path.isfile(arg):
+        urls = read_urls_from_file(arg)
+        if not urls:
+            print(f'❌ No URLs found in {arg}')
+            sys.exit(1)
+
+        print(f'📦 Batch mode: {len(urls)} URL(s) from {arg}\n')
+        succeeded, failed = 0, 0
+        for i, reel_url in enumerate(urls, start=1):
+            print(f'━━━ [{i}/{len(urls)}] {reel_url} ━━━')
+            try:
+                process_reel(reel_url)
+                succeeded += 1
+            except Exception as e:
+                failed += 1
+                print(f'\n❌ Failed [{i}/{len(urls)}] {reel_url}: {str(e)}\n')
+
+        print(f'\n📊 Batch complete: {succeeded} succeeded, {failed} failed (of {len(urls)})')
+        if failed:
+            sys.exit(1)
+        return
+
+    # Single URL mode
     try:
-        validate_url(reel_url)
+        process_reel(arg)
     except ValueError as e:
         print(str(e))
         sys.exit(1)
-
-    try:
-        print('🚀 Starting reel summarizer\n')
-
-        # Fetch transcript
-        transcript = fetch_transcript(reel_url)
-
-        # Summarize
-        summary = summarize_text(transcript)
-
-        # Save to Notion
-        save_to_notion(summary)
-
-        print('🎉 All done!')
-
     except Exception as e:
         print(f'\n❌ Process failed: {str(e)}')
         sys.exit(1)

@@ -17,7 +17,8 @@ cp .env.example .env
 
 ### 3️⃣ Run it!
 ```bash
-uv run reel_summarizer.py "https://www.instagram.com/reel/ABC123xyz/"
+uv run reel-summarizer "https://www.instagram.com/reel/ABC123xyz/"
+# Or, inside the venv: source .venv/bin/activate, then reel-summarizer "<url>"
 ```
 
 ---
@@ -84,7 +85,7 @@ notepad .env
 
 ```bash
 # Simplest way (with uv)
-uv run reel_summarizer.py "URL_HERE"
+uv run reel-summarizer "URL_HERE"
 
 # Or without uv (if dependencies installed)
 python reel_summarizer.py "URL_HERE"
@@ -92,8 +93,8 @@ python reel_summarizer.py "URL_HERE"
 
 ### Examples
 ```bash
-uv run reel_summarizer.py "https://www.instagram.com/reel/ABC123xyz/"
-uv run reel_summarizer.py "https://www.instagram.com/p/XYZ789abc/"
+uv run reel-summarizer "https://www.instagram.com/reel/ABC123xyz/"
+uv run reel-summarizer "https://www.instagram.com/p/XYZ789abc/"
 ```
 
 ---
@@ -104,13 +105,13 @@ The script **defaults to free Mistral 7B model**. No payment needed!
 
 ```bash
 # In .env (optional - this is the default)
-OPENROUTER_MODEL=mistralai/mistral-7b-instruct
+LLM_MODEL=mistralai/mistral-7b-instruct
 ```
 
 Other free options:
 ```bash
-OPENROUTER_MODEL=meta-llama/llama-2-7b-chat
-OPENROUTER_MODEL=nous-hermes-2-mixtral-8x7b-dpo
+LLM_MODEL=meta-llama/llama-2-7b-chat
+LLM_MODEL=nous-hermes-2-mixtral-8x7b-dpo
 ```
 
 See `.env.example` for complete list and comparisons.
@@ -124,7 +125,7 @@ See `.env.example` for complete list and comparisons.
 uv sync
 
 # Run script
-uv run reel_summarizer.py "url"
+uv run reel-summarizer "url"
 
 # Get Python shell with dependencies
 uv run python
@@ -154,7 +155,6 @@ your-project/
 ├── reel_summarizer.py          # Main script
 ├── pyproject.toml              # uv configuration
 ├── uv.lock                     # Dependencies lock file (auto-created)
-├── requirements.txt            # Fallback for pip
 ├── .env                        # Your API keys (DON'T commit!)
 ├── .env.example               # Template
 └── UV_QUICKSTART.md           # Quick start guide
@@ -208,7 +208,7 @@ uv sync
 1. ✅ Install uv
 2. ✅ Run `uv sync`
 3. ✅ Create `.env` with your API keys
-4. ✅ Run `uv run reel_summarizer.py "your-url"`
+4. ✅ Run `uv run reel-summarizer "your-url"`
 5. 🎉 Done!
 
 See `README.md` for detailed docs and advanced usage.

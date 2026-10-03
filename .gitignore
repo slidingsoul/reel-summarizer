@@ -1,2 +1,34 @@
-.venv/
+# Environment & secrets (keep .env.example tracked)
 .env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test / coverage / typecheck caches
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Logs & temp
+*.log
+/tmp/
+
+# macOS / editors
+.DS_Store
+.vscode/
+.idea/
+
+reels.txt

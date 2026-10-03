@@ -1,12 +1,13 @@
 # Instagram Reel Summarizer CLI (Python + uv)
 
-A Python CLI tool that fetches Instagram reel transcripts, summarizes them with AI (OpenRouter), and saves the results to Notion.
+A Python CLI tool that fetches Instagram reel transcripts, summarizes them with any OpenAI-compatible LLM API, and saves the results to Notion.
 
 ## Features
 
-✨ Fetch transcripts from Instagram reels using SocialKit API  
-🤖 Summarize transcripts with OpenRouter's AI models  
+✨ Fetch transcripts from Instagram reels using SocialKit API (with Supadata fallback on quota exhaustion)  
+🤖 Summarize transcripts with any OpenAI-compatible LLM (OpenRouter, OpenAI, Ollama, ...)  
 📝 Automatically save summaries to your Notion database  
+📦 Batch mode — pass a file with one URL per line  
 🔄 End-to-end automation from reel to Notion  
 
 ## Prerequisites
@@ -14,8 +15,9 @@ A Python CLI tool that fetches Instagram reel transcripts, summarizes them with 
 - **Python 3.10+** installed
 - **uv** - Fast Python package manager (install from https://docs.astral.sh/uv/getting-started/)
 - Active accounts and API keys for:
-  - [SocialKit](https://www.socialkit.dev) (for Instagram transcript extraction)
-  - [OpenRouter](https://openrouter.ai) (for AI summarization)
+  - [SocialKit](https://www.socialkit.dev) (primary Instagram transcript extraction)
+  - [Supadata](https://dash.supadata.ai) (fallback transcription, used only when SocialKit quota/credits are exhausted)
+  - Any OpenAI-compatible LLM API (for AI summarization — e.g. [OpenRouter](https://openrouter.ai), OpenAI, or local Ollama/LM Studio)
   - [Notion](https://www.notion.com) (for saving results)
 
 ## Quick Setup with uv
@@ -47,12 +49,9 @@ uv --version
 ```bash
 # Using uv (recommended - much faster!)
 uv sync
-
-# Or if you prefer pip still
-pip install -r requirements.txt
 ```
 
-That's it! `uv sync` handles everything.
+That's it! `uv sync` handles everything: it creates `.venv`, installs all dependencies from `pyproject.toml`, and installs the `reel-summarizer` command.
 
 ### 3. Get API Keys
 
@@ -61,11 +60,17 @@ That's it! `uv sync` handles everything.
 2. Sign up and go to your dashboard
 3. Copy your API key from the API section
 
-#### OpenRouter API Key
-1. Visit [OpenRouter](https://openrouter.ai)
-2. Create an account
-3. Go to Settings → Keys
-4. Create a new API key
+#### Supadata API Key (fallback)
+1. Visit [Supadata dashboard](https://dash.supadata.ai)
+2. Sign up — your API key is generated automatically during onboarding
+3. Copy it from the dashboard (see [Supadata docs](https://docs.supadata.ai/))
+4. Required: the script validates `SUPADATA_API_KEY` at startup and uses it via the official `supadata` Python SDK (`transcript(url, text=True, mode="auto")`) only when SocialKit reports a quota/credit error (HTTP 402/403/429 or quota message)
+
+#### LLM API Key (any OpenAI-compatible provider)
+1. Pick a provider and get an API key (e.g. [OpenRouter](https://openrouter.ai) → Settings → Keys, or [OpenAI](https://platform.openai.com/api-keys))
+2. Set `LLM_API_URL` to its chat-completions endpoint, `LLM_API_KEY` to the key, and `LLM_MODEL` to the model name
+3. Local servers (Ollama, LM Studio): set `LLM_API_URL` (e.g. `http://localhost:11434/v1/chat/completions`) — any non-empty `LLM_API_KEY` works
+4. Legacy `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` are still honored if the `LLM_*` vars are unset
 
 #### Notion API Token
 1. Go to [Notion Integrations](https://www.notion.com/my-integrations)
@@ -73,10 +78,11 @@ That's it! `uv sync` handles everything.
 3. Name it (e.g., "Reel Summarizer")
 4. Copy the "Internal Integration Token"
 
-#### Notion Database ID
-1. Open the Notion database where you want to save summaries
+#### Notion Page ID
+1. Open the Notion parent page where summaries should be created as subpages
 2. Look at the URL: `https://notion.so/yourworkspace/abc123def456?v=xyz`
-3. The database ID is the part between `/` and `?` (32 characters)
+3. The page ID is the part between `/` and `?` (32 characters)
+4. Share the page with your integration (page → `...` → Add connections)
 
 ### 4. Create .env File
 
@@ -87,50 +93,73 @@ cp .env.example .env
 Edit `.env` and add your API keys:
 ```
 SOCIALKIT_API_KEY=sk_xxx...
-OPENROUTER_API_KEY=sk-or-xxx...
-OPENROUTER_MODEL=mistralai/mistral-7b-instruct
+SUPADATA_API_KEY=supa_xxx...
+LLM_API_URL=https://openrouter.ai/api/v1/chat/completions
+LLM_API_KEY=sk-or-xxx...
+LLM_MODEL=mistralai/mistral-7b-instruct
 NOTION_TOKEN=secret_xxx...
 NOTION_FOLDER_PAGE_ID=abc123def456789abc123def456789ab
 ```
 
-**💡 Pro Tip:** The `OPENROUTER_MODEL` is optional. It defaults to **Mistral 7B (free)** for summarizing!  
-See `.env.example` for other free models or paid alternatives.
+**💡 Pro Tip:** `LLM_MODEL` is optional. It defaults to **Mistral 7B (free)** on OpenRouter for summarizing!  
+Point `LLM_API_URL` at OpenAI (`https://api.openai.com/v1/chat/completions`) or a local server (e.g. Ollama at `http://localhost:11434/v1/chat/completions`) to switch providers — no code changes needed. Legacy `OPENROUTER_*` vars still work.
 
 ## Model Configuration
 
-The script uses **free models by default**! No additional cost for summarization.
+The script uses **free models by default** on OpenRouter! No additional cost for summarization. Any OpenAI-compatible endpoint works — just change `LLM_API_URL` / `LLM_MODEL`.
 
-### Free Models (Default ✅)
+### Free Models (Default ✅, OpenRouter)
 
 ```bash
 # Mistral 7B (default - fastest & free)
-OPENROUTER_MODEL=mistralai/mistral-7b-instruct
+LLM_MODEL=mistralai/mistral-7b-instruct
 
 # Llama 2 (free alternative)
-OPENROUTER_MODEL=meta-llama/llama-2-7b-chat
+LLM_MODEL=meta-llama/llama-2-7b-chat
 ```
 
 ### Paid Models (Better Quality)
 
 ```bash
 # GPT-4 Turbo (~$0.01-0.03 per request)
-OPENROUTER_MODEL=openai/gpt-4-turbo-preview
+LLM_MODEL=openai/gpt-4-turbo-preview
 
 # Claude 3 Opus (~$0.015-0.08 per request)
-OPENROUTER_MODEL=anthropic/claude-3-opus
+LLM_MODEL=anthropic/claude-3-opus
 ```
 
-Just set `OPENROUTER_MODEL` in your `.env` file and you're good to go!
+### Other Providers
+
+```bash
+# OpenAI directly
+LLM_API_URL=https://api.openai.com/v1/chat/completions
+LLM_MODEL=gpt-4o-mini
+
+# Local Ollama (any non-empty LLM_API_KEY works)
+LLM_API_URL=http://localhost:11434/v1/chat/completions
+LLM_MODEL=llama3.1
+```
+
+Just set the vars in your `.env` file and you're good to go!
 
 📖 See `.env.example` for complete list and comparison.
 
 ## Usage
 
-### With uv (Recommended)
+### Inside the venv (Recommended)
+
+After `uv sync`, the `reel-summarizer` command is installed into `.venv`:
 
 ```bash
-# Run directly with uv
-uv run reel_summarizer.py "https://www.instagram.com/reel/ABC123xyz/"
+source .venv/bin/activate
+reel-summarizer "https://www.instagram.com/reel/ABC123xyz/"
+```
+
+### With uv (no activation needed)
+
+```bash
+# Run the installed command in the project environment
+uv run reel-summarizer "https://www.instagram.com/reel/ABC123xyz/"
 ```
 
 ### Standard Python
@@ -140,17 +169,25 @@ uv run reel_summarizer.py "https://www.instagram.com/reel/ABC123xyz/"
 python reel_summarizer.py "https://www.instagram.com/reel/ABC123xyz/"
 ```
 
+> Note: `.env` is loaded from your current directory, so run the command with the project directory as your working directory (the shell function below handles this for you).
+
 ### Examples
 
 ```bash
 # Using full Instagram reel URL
-uv run reel_summarizer.py "https://www.instagram.com/p/ABC123xyz/"
+reel-summarizer "https://www.instagram.com/p/ABC123xyz/"
 
 # Works with both /reel/ and /p/ formats
-uv run reel_summarizer.py "https://www.instagram.com/reel/XYZ789abc/"
+reel-summarizer "https://www.instagram.com/reel/XYZ789abc/"
+
+# Same via uv without activating
+uv run reel-summarizer "https://www.instagram.com/reel/XYZ789abc/"
 
 # With environment variable (if .env isn't in current dir)
-SOCIALKIT_API_KEY=sk_xxx uv run reel_summarizer.py "https://www.instagram.com/reel/ABC/"
+SOCIALKIT_API_KEY=sk_xxx reel-summarizer "https://www.instagram.com/reel/ABC/"
+
+# Batch file (one URL per line, `#` comments and blanks ignored)
+reel-summarizer reels.txt
 ```
 
 ## What Happens
@@ -159,11 +196,15 @@ SOCIALKIT_API_KEY=sk_xxx uv run reel_summarizer.py "https://www.instagram.com/re
 Instagram Reel URL 
     ↓
 📹 Fetch transcript (SocialKit API)
+    ↓ (only on SocialKit quota/credit exhaustion: 402/403/429)
+📹 Fallback transcript (Supadata API, mode="auto")
     ↓
-🤖 Summarize with AI (OpenRouter)
+🤖 Summarize with AI (LLM)
     ↓
 📝 Save to Notion Database
 ```
+
+The fallback triggers **only** on quota-like SocialKit failures — not on private reels, missing audio, or invalid URLs. Watch the log source tag (`[SocialKit]` vs `[Supadata]`) to see which provider succeeded.
 
 ## Output Example
 
@@ -171,15 +212,14 @@ Instagram Reel URL
 🚀 Starting reel summarizer
 
 📹 Fetching transcript from SocialKit...
+✅ Transcript fetched successfully [SocialKit]
    Length: 1247 characters
 
-✅ Transcript fetched successfully
-
-🤖 Sending to OpenRouter for summarization...
+🤖 Sending to LLM for summarization (model: mistralai/mistral-7b-instruct)...
 ✅ Summarization complete
 
-📝 Saving to Notion...
-✅ Saved to Notion successfully
+📝 Creating subpage in Notion...
+✅ Subpage created successfully
 
 📌 Page URL: https://notion.so/abc123def456789
 
@@ -193,7 +233,7 @@ Instagram Reel URL
 uv sync
 
 # Run the script
-uv run reel_summarizer.py "url-here"
+uv run reel-summarizer "url-here"
 
 # Run Python REPL with dependencies available
 uv run python
@@ -239,6 +279,15 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 export PATH="$HOME/.cargo/bin:$PATH"
 ```
 
+### "`VIRTUAL_ENV=...` does not match the project environment path"
+Your shell has a stale venv activated from before the repo moved. Fix it:
+```bash
+deactivate 2>/dev/null; unset VIRTUAL_ENV
+cd ~/Documents/personal-repos/openrouter-instagram
+source .venv/bin/activate
+```
+If the warning returns in every new terminal, the old path is being re-injected outside your shell configs — check terminal session restore, direnv `.envrc` files, or VS Code's `terminal.integrated.env` / Python interpreter setting. (`uv run --active` forces uv to use the currently active environment instead.)
+
 ### "ModuleNotFoundError: No module named 'requests'"
 Run dependencies sync:
 ```bash
@@ -247,16 +296,24 @@ uv sync
 
 ### "Missing required environment variables"
 - Ensure your `.env` file exists in the same directory as the script
-- Verify all four variables are set (not commented out)
+- Verify all five variables are set (not commented out): `SOCIALKIT_API_KEY`, `SUPADATA_API_KEY`, `LLM_API_KEY` (or legacy `OPENROUTER_API_KEY`), `NOTION_TOKEN`, `NOTION_FOLDER_PAGE_ID`
 
 ### "SocialKit API error"
 - Check that `SOCIALKIT_API_KEY` is correct
 - Verify the Instagram reel URL is public and has audio
 - Make sure you have enough credits on SocialKit
+- On quota exhaustion (402/403/429) the script automatically falls back to Supadata — check the log for `⚠️ SocialKit quota/credit issue detected`
 
-### "OpenRouter API error: 401"
-- Your `OPENROUTER_API_KEY` is invalid or expired
-- Regenerate it from [OpenRouter settings](https://openrouter.ai/settings/keys)
+### "Supadata error"
+- `unauthorized` → your `SUPADATA_API_KEY` is invalid; regenerate it at [dash.supadata.ai](https://dash.supadata.ai)
+- `limit-exceeded` → Supadata quota/rate limit hit; check usage in the dashboard or response `x-billable-requests` header
+- `transcript-unavailable` (HTTP 206) / empty transcript → no speech detected or reel is private/restricted; verify the reel plays in an incognito window
+- Long AI-generated transcripts may poll a job for up to ~120s before timing out
+
+### "LLM API error"
+- Your `LLM_API_KEY` (or legacy `OPENROUTER_API_KEY`) is invalid or expired
+- Regenerate it from [OpenRouter settings](https://openrouter.ai/settings/keys) or your provider's dashboard
+- If using a local server, check `LLM_API_URL` is reachable and `LLM_MODEL` is pulled/available
 
 ### "Notion API error"
 - Verify `NOTION_TOKEN` is correct
@@ -277,14 +334,14 @@ Add to your shell config (`~/.zshrc` for zsh, `~/.bashrc` for bash):
 **zsh (`~/.zshrc`):**
 ```bash
 reel-summarizer() {
-  cd "$HOME/personal-repos/openrouter-instagram" && uv run reel_summarizer.py "$@"
+  cd "$HOME/Documents/personal-repos/openrouter-instagram" && uv run reel-summarizer "$@"
 }
 ```
 
 **bash (`~/.bashrc`):**
 ```bash
 reel-summarizer() {
-  cd "$HOME/personal-repos/openrouter-instagram" && uv run reel_summarizer.py "$@"
+  cd "$HOME/Documents/personal-repos/openrouter-instagram" && uv run reel-summarizer "$@"
 }
 ```
 
@@ -296,26 +353,13 @@ source ~/.zshrc    # or: source ~/.bashrc
 reel-summarizer "https://www.instagram.com/reel/ABC123xyz/"
 ```
 
-### Option 2: Executable Script (macOS/Linux)
-
-```bash
-# Make executable
-chmod +x reel_summarizer.py
-
-# Create symlink
-sudo ln -s "$(pwd)/reel_summarizer.py" /usr/local/bin/reel-summarizer
-
-# Now use it (you'll need uv in your PATH)
-reel-summarizer "https://www.instagram.com/reel/ABC123xyz/"
-```
-
-### Option 3: Wrapper Script
+### Option 2: Wrapper Script
 
 Create `reel-summarizer.sh`:
 ```bash
 #!/bin/bash
 cd /path/to/project
-uv run reel_summarizer.py "$@"
+uv run reel-summarizer "$@"
 ```
 
 Then:
@@ -328,7 +372,7 @@ chmod +x reel-summarizer.sh
 
 ### Batch Processing
 
-Create `reels.txt`:
+Create `reels.txt` (one URL per line; blank lines and `#` comments are ignored):
 ```
 https://www.instagram.com/reel/ABC123xyz/
 https://www.instagram.com/reel/XYZ789abc/
@@ -337,10 +381,9 @@ https://www.instagram.com/p/DEF456uvw/
 
 Run batch:
 ```bash
-while IFS= read -r url; do
-  uv run reel_summarizer.py "$url"
-done < reels.txt
+reel-summarizer reels.txt
 ```
+Each reel is processed in turn; failures are logged per URL without stopping the batch, and a summary (`X succeeded, Y failed`) is printed at the end (exit code 1 if any failed).
 
 ### Automation with Cron (macOS/Linux)
 
@@ -349,7 +392,7 @@ done < reels.txt
 crontab -e
 
 # Add this line to run every day at 9 AM
-0 9 * * * cd /path/to/project && uv run reel_summarizer.py "https://www.instagram.com/reel/ABC123xyz/" >> /tmp/reel_summary.log 2>&1
+0 9 * * * cd /path/to/project && uv run reel-summarizer "https://www.instagram.com/reel/ABC123xyz/" >> /tmp/reel_summary.log 2>&1
 ```
 
 ## Project Structure
@@ -357,9 +400,8 @@ crontab -e
 ```
 .
 ├── reel_summarizer.py      # Main CLI script
-├── pyproject.toml          # Project metadata (uv config)
+├── pyproject.toml          # Project metadata + dependencies (uv config)
 ├── uv.lock                 # Lock file (auto-generated)
-├── requirements.txt        # Fallback for pip
 ├── .env.example           # Environment template
 └── UV_QUICKSTART.md       # Quick start guide
 ```
@@ -367,7 +409,8 @@ crontab -e
 ## Cost Considerations
 
 - **SocialKit**: ~1 credit per transcript fetch
-- **OpenRouter**: Varies by model (~$0.001-0.01 per request with auto model)
+- **Supadata** (fallback only): 1 credit per native transcript, 2 credits per minute of AI-generated audio
+- **LLM**: Varies by provider/model (~$0.001-0.01 per request with auto/free model on OpenRouter; local Ollama/LM Studio is free)
 - **Notion**: Free (but requires existing workspace)
 
 ## Security Notes
@@ -393,5 +436,6 @@ MIT
 For issues with:
 - **uv**: Visit [uv Documentation](https://docs.astral.sh/uv/)
 - **SocialKit**: Visit [SocialKit Docs](https://docs.socialkit.dev)
-- **OpenRouter**: Visit [OpenRouter Docs](https://openrouter.ai/docs)
+- **Supadata**: Visit [Supadata Docs](https://docs.supadata.ai/)
+- **LLM**: Visit [OpenRouter Docs](https://openrouter.ai/docs) (or your provider's docs)
 - **Notion**: Visit [Notion API Docs](https://developers.notion.com)
