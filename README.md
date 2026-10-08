@@ -427,10 +427,6 @@ crontab -e
 - Video URLs from Instagram expire after a few hours
 - uv is extremely fast (~10-50ms for most commands)
 
-## License
-
-MIT
-
 ## Support
 
 For issues with:
